@@ -1,46 +1,84 @@
 # =====================================================================
-#  Il mio server — passo 2: con DATABASE (ricorda i dati)
+#  Il mio server — passo 3: parla anche in JSON e sceglie il database
 # ---------------------------------------------------------------------
-#  Ora il server non solo risponde, ma SALVA e RILEGGE dati da un
-#  database Postgres (che creiamo su Render).
-#  L'indirizzo del database NON è scritto qui dentro: lo prendiamo da una
-#  "variabile d'ambiente" (DATABASE_URL), così resta fuori dal codice.
-#  È il modo serio e sicuro di tenere password/indirizzi (utile anche per GDPR).
+#  Novità di questo passo:
+#   1) Il server capisce DA SOLO dove sta girando:
+#        - sul tuo Mac (in locale)  -> usa un piccolo file SQLite
+#        - su Render (online)       -> usa il Postgres vero
+#      Tu non devi cambiare niente: il codice se ne accorge da solo.
+#   2) Nuovo indirizzo /api/messaggi: come /elenco, ma risponde in JSON
+#      (dati con etichette), cioe' nella "lingua" che capiscono le app.
 # =====================================================================
 
 import os
-from flask import Flask
-import psycopg2          # il "ponte" che fa parlare Python col database Postgres
+from datetime import datetime
+from flask import Flask, jsonify   # jsonify = costruisce una risposta JSON
 
 app = Flask(__name__)
 
-# l'indirizzo del database arriva da fuori (lo imposteremo su Render)
+# L'indirizzo del database "vero" arriva da fuori (lo imposta Render).
+# Sul tuo Mac questa variabile NON esiste, quindi resta None.
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Decidiamo quale database usare in base a DOVE gira il server:
+#   - se DATABASE_URL esiste  -> siamo su Render -> Postgres
+#   - se NON esiste           -> siamo sul Mac   -> file SQLite locale
+USA_POSTGRES = bool(DATABASE_URL)
+
+if USA_POSTGRES:
+    import psycopg2
+    PH = "%s"          # "segnaposto" per i valori, stile Postgres
+else:
+    import sqlite3      # SQLite e' gia' dentro Python: niente da installare
+    PH = "?"           # "segnaposto" per i valori, stile SQLite
+    DB_FILE = "locale.db"   # il mini-database: un semplice file accanto ad app.py
 
 
 def get_conn():
-    """Apre una connessione al database."""
-    return psycopg2.connect(DATABASE_URL)
+    """Apre una connessione al database giusto (Postgres o SQLite)."""
+    if USA_POSTGRES:
+        return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(DB_FILE)
 
 
 def init_db():
-    """Crea la tabella 'messaggi' se non esiste ancora."""
-    if not DATABASE_URL:
-        return
+    """Crea la tabella 'messaggi' se non esiste ancora.
+    La riga della tabella e' leggermente diversa tra i due database,
+    quindi la scriviamo nei due modi."""
     con = get_conn(); cur = con.cursor()
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS messaggi ("
-        " id SERIAL PRIMARY KEY,"
-        " testo TEXT,"
-        " quando TIMESTAMP DEFAULT NOW())"
-    )
+    if USA_POSTGRES:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS messaggi ("
+            " id SERIAL PRIMARY KEY,"
+            " testo TEXT,"
+            " quando TIMESTAMP DEFAULT NOW())"
+        )
+    else:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS messaggi ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " testo TEXT,"
+            " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
     con.commit(); cur.close(); con.close()
 
 
-# --- indirizzi base (come prima) ---
+def fmt_quando(q):
+    """Mostra la data/ora in modo leggibile.
+    Postgres la restituisce gia' come data Python; SQLite come testo:
+    questa funzione gestisce bene entrambi i casi."""
+    if isinstance(q, datetime):
+        return q.strftime("%d/%m %H:%M")
+    try:
+        return datetime.strptime(str(q)[:16], "%Y-%m-%d %H:%M").strftime("%d/%m %H:%M")
+    except Exception:
+        return str(q)
+
+
+# --- indirizzi base ---
 @app.route("/")
 def home():
-    return "Ciao! Il tuo server con database è attivo. 🎉  Prova /scrivi/ciao e poi /elenco"
+    return "Ciao! Il tuo server con database e' attivo. 🎉  Prova /scrivi/ciao e poi /elenco"
 
 
 @app.route("/saluto/<nome>")
@@ -48,31 +86,55 @@ def saluto(nome):
     return f"Ciao {nome}, benvenuto nel tuo server!"
 
 
-# --- SALVA un messaggio nel database ---
+# --- PRIMO assaggio di JSON (una risposta sola, fissa) ---
+@app.route("/api/ciao")
+def api_ciao():
+    return jsonify({
+        "messaggio": "Ciao Davide",
+        "stato": "ok",
+        "tipo_risposta": "JSON"
+    })
+
+
+# --- SALVA un messaggio nel database (per ora ancora con GET, lo cambieremo) ---
 @app.route("/scrivi/<testo>")
 def scrivi(testo):
-    if not DATABASE_URL:
-        return "Database non collegato (manca DATABASE_URL)."
     con = get_conn(); cur = con.cursor()
-    cur.execute("INSERT INTO messaggi (testo) VALUES (%s)", (testo,))
+    cur.execute(f"INSERT INTO messaggi (testo) VALUES ({PH})", (testo,))
     con.commit(); cur.close(); con.close()
-    return f"Salvato nel database: «{testo}». Vai su /elenco per vederli tutti."
+    return f"Salvato nel database: «{testo}». Vai su /elenco oppure /api/messaggi."
 
 
-# --- RILEGGE tutti i messaggi salvati ---
+# --- RILEGGE i messaggi, versione per UMANI (testo) ---
 @app.route("/elenco")
 def elenco():
-    if not DATABASE_URL:
-        return "Database non collegato (manca DATABASE_URL)."
     con = get_conn(); cur = con.cursor()
     cur.execute("SELECT testo, quando FROM messaggi ORDER BY id DESC")
     righe = cur.fetchall(); cur.close(); con.close()
     if not righe:
         return "Nessun messaggio salvato. Prova prima /scrivi/ciao"
-    return "<br>".join(f"{q:%d/%m %H:%M} — {t}" for (t, q) in righe)
+    return "<br>".join(f"{fmt_quando(q)} — {t}" for (t, q) in righe)
 
 
-# crea la tabella all'avvio (vale anche quando gira con gunicorn)
+# --- RILEGGE i messaggi, versione per APP (JSON) ---
+# Stessi dati di /elenco, ma "impacchettati" con le etichette:
+# un'app puo' leggere ogni campo senza dover interpretare del testo.
+@app.route("/api/messaggi")
+def api_messaggi():
+    con = get_conn(); cur = con.cursor()
+    cur.execute("SELECT id, testo, quando FROM messaggi ORDER BY id DESC")
+    righe = cur.fetchall(); cur.close(); con.close()
+    messaggi = [
+        {"id": r[0], "testo": r[1], "quando": fmt_quando(r[2])}
+        for r in righe
+    ]
+    return jsonify({
+        "quanti": len(messaggi),
+        "messaggi": messaggi
+    })
+
+
+# crea la tabella all'avvio (vale anche quando gira con gunicorn su Render)
 try:
     init_db()
 except Exception as e:
