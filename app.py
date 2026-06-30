@@ -335,12 +335,39 @@ def api_variazioni():
     return jsonify({"quanti": len(giorni), "giorni": giorni})
 
 
-@app.route("/api/variazioni/<data>")
+@app.route("/api/variazioni/<data>", methods=["GET", "PUT"])
 def api_variazioni_giorno(data):
-    """Legge UN giorno preciso. Esempio: /api/variazioni/2026-06-28"""
+    """GET = legge UN giorno (es. /api/variazioni/2026-06-28).
+    PUT = AGGIORNA/sovrascrive quel giorno di proposito (se non c'e', lo crea)."""
     if not data_valida(data):
         return jsonify({"stato": "errore",
                         "motivo": "data non valida (serve aaaa-mm-gg)"}), 400
+
+    # --- PUT: rimpiazza il giorno (aggiornamento voluto, senza blocco) ---
+    if request.method == "PUT":
+        dati = request.get_json(silent=True) or {}
+        mappa = dati.get("mappa")
+        caricato_da = str(dati.get("caricato_da") or "").strip()
+        if mappa is None:
+            return jsonify({"stato": "errore", "motivo": "manca il campo 'mappa'"}), 400
+        mappa_testo = json.dumps(mappa, ensure_ascii=False)
+        adesso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        con = get_conn(); cur = con.cursor()
+        cur.execute(f"SELECT id FROM variazioni WHERE data = {PH}", (data,))
+        if cur.fetchone():
+            cur.execute(
+                f"UPDATE variazioni SET mappa={PH}, caricato_da={PH}, quando={PH} WHERE data={PH}",
+                (mappa_testo, caricato_da, adesso, data))
+            stato = "aggiornato"
+        else:
+            cur.execute(
+                f"INSERT INTO variazioni (data, mappa, caricato_da, quando) VALUES ({PH},{PH},{PH},{PH})",
+                (data, mappa_testo, caricato_da, adesso))
+            stato = "creato"
+        con.commit(); cur.close(); con.close()
+        return jsonify({"stato": stato, "data": data})
+
+    # --- GET: legge il giorno ---
     con = get_conn(); cur = con.cursor()
     cur.execute(f"SELECT mappa, caricato_da, quando FROM variazioni WHERE data = {PH}", (data,))
     riga = cur.fetchone(); cur.close(); con.close()
@@ -388,6 +415,7 @@ PAGINA_PROVA_REGISTRO = """
   <div><label>Turno</label><input id="turno" placeholder="es. 101"></div>
 
   <button onclick="salva()">Salva giorno</button>
+  <button onclick="aggiorna()">Aggiorna (forza)</button>
   <button onclick="leggi()">Leggi questo giorno</button>
   <button onclick="elenca()">Elenca i giorni</button>
 
@@ -415,6 +443,24 @@ PAGINA_PROVA_REGISTRO = """
       else if (r.status === 409) e.textContent =
         '⛔ Bloccato: il giorno ' + d.data + ' era gia stato caricato da ' + (d.caricato_da || 'qualcuno');
       else e.textContent = '⚠ ' + (d.motivo || 'errore');
+      mostra(d);
+    }
+
+    async function aggiorna(){
+      const data = document.getElementById('data').value;
+      const matr = document.getElementById('matr').value.trim();
+      const turno = document.getElementById('turno').value.trim();
+      const mappa = {}; if (matr) mappa[matr] = { turno: turno };
+      const r = await fetch('/api/variazioni/' + data, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mappa: mappa, caricato_da: matr })
+      });
+      const d = await r.json();
+      document.getElementById('esito').textContent =
+        (d.stato === 'aggiornato') ? ('✏️ Giorno ' + d.data + ' aggiornato (sovrascritto)')
+        : (d.stato === 'creato') ? ('✓ Giorno ' + d.data + ' creato')
+        : ('⚠ ' + (d.motivo || 'errore'));
       mostra(d);
     }
 
