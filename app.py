@@ -13,9 +13,28 @@
 import os
 import json                                  # per impacchettare/spacchettare i dati JSON
 from datetime import datetime
-from flask import Flask, jsonify, request   # request = legge i dati "nel pacco" della richiesta
+from flask import Flask, jsonify, request, Response   # request = legge i dati "nel pacco"
 
 app = Flask(__name__)
+
+
+# --- CORS: permette a una webapp (su un altro indirizzo) di chiamare questo server ---
+# Senza questo, il browser bloccherebbe le chiamate dell'app verso onrender.com.
+# Apriamo a tutti ("*") perche' il registro e' condiviso; si stringe col prodotto vero.
+@app.after_request
+def aggiungi_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+# Prima di un POST "vero", il browser manda una domanda di controllo (OPTIONS):
+# "posso chiamarti?". Rispondiamo subito di si', cosi' poi parte la chiamata vera.
+@app.before_request
+def gestisci_preflight():
+    if request.method == "OPTIONS":
+        return Response(status=200)
 
 # L'indirizzo del database "vero" arriva da fuori (lo imposta Render).
 # Sul tuo Mac questa variabile NON esiste, quindi resta None.
