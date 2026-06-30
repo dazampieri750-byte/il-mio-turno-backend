@@ -11,6 +11,7 @@
 # =====================================================================
 
 import os
+import json                                  # per impacchettare/spacchettare i dati JSON
 from datetime import datetime
 from flask import Flask, jsonify, request   # request = legge i dati "nel pacco" della richiesta
 
@@ -53,11 +54,29 @@ def init_db():
             " testo TEXT,"
             " quando TIMESTAMP DEFAULT NOW())"
         )
+        # registro variazioni: 'data' e' UNIQUE -> il database stesso
+        # impedisce due righe con lo stesso giorno (rete di sicurezza del blocco)
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS variazioni ("
+            " id SERIAL PRIMARY KEY,"
+            " data TEXT UNIQUE,"
+            " mappa TEXT,"
+            " caricato_da TEXT,"
+            " quando TIMESTAMP DEFAULT NOW())"
+        )
     else:
         cur.execute(
             "CREATE TABLE IF NOT EXISTS messaggi ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " testo TEXT,"
+            " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS variazioni ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " data TEXT UNIQUE,"
+            " mappa TEXT,"
+            " caricato_da TEXT,"
             " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
     con.commit(); cur.close(); con.close()
@@ -73,6 +92,15 @@ def fmt_quando(q):
         return datetime.strptime(str(q)[:16], "%Y-%m-%d %H:%M").strftime("%d/%m %H:%M")
     except Exception:
         return str(q)
+
+
+def data_valida(d):
+    """Controlla che la data sia scritta come aaaa-mm-gg (es. 2026-06-28)."""
+    try:
+        datetime.strptime(d, "%Y-%m-%d")
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 # --- indirizzi base ---
@@ -219,6 +247,182 @@ PAGINA_PROVA = """
 @app.route("/prova")
 def prova():
     return PAGINA_PROVA
+
+
+# =====================================================================
+#  REGISTRO VARIAZIONI
+#  Un "giorno" = una data (aaaa-mm-gg) + un blocco di dati (la "mappa"
+#  delle variazioni, che il server NON apre: per lui e' una scatola
+#  chiusa) + chi l'ha caricato.
+#  Regola decisa: il primo che carica un giorno lo "congela" (blocco
+#  doppioni). Per ora non si sovrascrive; piu' avanti aggiungeremo un
+#  modo per aggiornare di proposito.
+# =====================================================================
+
+@app.route("/api/variazioni", methods=["GET", "POST"])
+def api_variazioni():
+
+    # --- POST: salva un giorno, con il BLOCCO se esiste gia' ---
+    if request.method == "POST":
+        dati = request.get_json(silent=True) or {}
+        data = str(dati.get("data") or "").strip()
+        mappa = dati.get("mappa")
+        caricato_da = str(dati.get("caricato_da") or "").strip()
+
+        if not data_valida(data):
+            return jsonify({"stato": "errore",
+                            "motivo": "data mancante o non valida (serve aaaa-mm-gg)"}), 400
+        if mappa is None:
+            return jsonify({"stato": "errore",
+                            "motivo": "manca il campo 'mappa'"}), 400
+
+        con = get_conn(); cur = con.cursor()
+
+        # 1a difesa (il caso normale): guardo se il giorno c'e' gia'
+        cur.execute(f"SELECT caricato_da FROM variazioni WHERE data = {PH}", (data,))
+        gia_presente = cur.fetchone()
+        if gia_presente:
+            cur.close(); con.close()
+            # codice 409 = "conflitto": esiste gia', non tocco niente
+            return jsonify({"stato": "esiste",
+                            "data": data,
+                            "caricato_da": gia_presente[0] or ""}), 409
+
+        # la mappa la trasformo in testo e la salvo cosi' com'e' (scatola chiusa)
+        mappa_testo = json.dumps(mappa, ensure_ascii=False)
+        try:
+            cur.execute(
+                f"INSERT INTO variazioni (data, mappa, caricato_da) "
+                f"VALUES ({PH}, {PH}, {PH})",
+                (data, mappa_testo, caricato_da)
+            )
+            con.commit()
+        except Exception:
+            # 2a difesa (rara): due caricamenti nello stesso istante.
+            # Il vincolo UNIQUE sulla data fa fallire il secondo -> "esiste".
+            con.rollback(); cur.close(); con.close()
+            return jsonify({"stato": "esiste", "data": data}), 409
+        cur.close(); con.close()
+        return jsonify({"stato": "salvato", "data": data}), 201
+
+    # --- GET (senza data): elenca i giorni presenti ---
+    con = get_conn(); cur = con.cursor()
+    cur.execute("SELECT data, caricato_da, quando FROM variazioni ORDER BY data DESC")
+    righe = cur.fetchall(); cur.close(); con.close()
+    giorni = [
+        {"data": r[0], "caricato_da": r[1] or "", "quando": fmt_quando(r[2])}
+        for r in righe
+    ]
+    return jsonify({"quanti": len(giorni), "giorni": giorni})
+
+
+@app.route("/api/variazioni/<data>")
+def api_variazioni_giorno(data):
+    """Legge UN giorno preciso. Esempio: /api/variazioni/2026-06-28"""
+    if not data_valida(data):
+        return jsonify({"stato": "errore",
+                        "motivo": "data non valida (serve aaaa-mm-gg)"}), 400
+    con = get_conn(); cur = con.cursor()
+    cur.execute(f"SELECT mappa, caricato_da, quando FROM variazioni WHERE data = {PH}", (data,))
+    riga = cur.fetchone(); cur.close(); con.close()
+    if not riga:
+        # giorno non ancora caricato: rispondo in modo chiaro, senza errore
+        return jsonify({"stato": "assente", "data": data, "mappa": None})
+    mappa = json.loads(riga[0]) if riga[0] else None   # riapro la scatola per il cliente
+    return jsonify({
+        "stato": "ok",
+        "data": data,
+        "caricato_da": riga[1] or "",
+        "quando": fmt_quando(riga[2]),
+        "mappa": mappa
+    })
+
+
+# --- PAGINETTA DI PROVA del registro variazioni (servita dal server) ---
+# La apri su /prova-registro. Scegli una data, metti una matricola e un
+# turno di prova, e premi Salva. Riprova lo stesso giorno: vedrai il BLOCCO.
+PAGINA_PROVA_REGISTRO = """
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prova registro variazioni</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 640px;
+           margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 22px; }
+    label { display: inline-block; width: 90px; }
+    input { padding: 8px; font-size: 16px; margin: 4px 0; }
+    button { padding: 9px 14px; font-size: 15px; cursor: pointer; margin: 6px 6px 6px 0; }
+    #esito { min-height: 22px; font-weight: bold; }
+    pre { background: #f4f4f4; padding: 12px; border-radius: 6px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h1>Prova: registro variazioni</h1>
+  <p>Salva un "giorno" di prova. Se riprovi lo stesso giorno, il server
+     lo blocca (non sovrascrive).</p>
+
+  <div><label>Data</label><input type="date" id="data"></div>
+  <div><label>Matricola</label><input id="matr" placeholder="es. 12345"></div>
+  <div><label>Turno</label><input id="turno" placeholder="es. 101"></div>
+
+  <button onclick="salva()">Salva giorno</button>
+  <button onclick="leggi()">Leggi questo giorno</button>
+  <button onclick="elenca()">Elenca i giorni</button>
+
+  <p id="esito"></p>
+  <pre id="out"></pre>
+
+  <script>
+    function mostra(obj){ document.getElementById('out').textContent =
+        JSON.stringify(obj, null, 2); }
+
+    async function salva(){
+      const data = document.getElementById('data').value;
+      const matr = document.getElementById('matr').value.trim();
+      const turno = document.getElementById('turno').value.trim();
+      // costruisco una "mappa" di prova: { matricola: { turno: ... } }
+      const mappa = {}; if (matr) mappa[matr] = { turno: turno };
+      const r = await fetch('/api/variazioni', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: data, mappa: mappa, caricato_da: matr })
+      });
+      const d = await r.json();
+      const e = document.getElementById('esito');
+      if (r.status === 201) e.textContent = '✓ Salvato il giorno ' + d.data;
+      else if (r.status === 409) e.textContent =
+        '⛔ Bloccato: il giorno ' + d.data + ' era gia stato caricato da ' + (d.caricato_da || 'qualcuno');
+      else e.textContent = '⚠ ' + (d.motivo || 'errore');
+      mostra(d);
+    }
+
+    async function leggi(){
+      const data = document.getElementById('data').value;
+      const r = await fetch('/api/variazioni/' + data);
+      const d = await r.json();
+      document.getElementById('esito').textContent =
+        (d.stato === 'ok') ? ('Giorno ' + d.data + ' trovato') : ('Giorno ' + data + ': ' + d.stato);
+      mostra(d);
+    }
+
+    async function elenca(){
+      const r = await fetch('/api/variazioni');
+      const d = await r.json();
+      document.getElementById('esito').textContent = 'Giorni nel registro: ' + d.quanti;
+      mostra(d);
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/prova-registro")
+def prova_registro():
+    return PAGINA_PROVA_REGISTRO
 
 
 # crea la tabella all'avvio (vale anche quando gira con gunicorn su Render)
