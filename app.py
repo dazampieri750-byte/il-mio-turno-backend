@@ -116,27 +116,36 @@ def init_db():
             " nota TEXT,"
             " quando TIMESTAMP DEFAULT NOW())"
         )
-        # elenco matricole valide (chi puo' registrarsi); si popola da solo
+        # elenco matricole valide (chi puo' registrarsi), separato per azienda
         cur.execute(
             "CREATE TABLE IF NOT EXISTS matricole_valide ("
-            " matricola TEXT PRIMARY KEY,"
+            " id SERIAL PRIMARY KEY,"
+            " azienda_id INTEGER,"
+            " matricola TEXT,"
             " attiva BOOLEAN DEFAULT TRUE,"
-            " aggiornata TIMESTAMP DEFAULT NOW())"
+            " aggiornata TIMESTAMP DEFAULT NOW(),"
+            " UNIQUE (azienda_id, matricola))"
         )
-        # utenti registrati (password SEMPRE hashata, mai in chiaro)
+        # utenti registrati (password SEMPRE hashata). Ogni utente appartiene a
+        # un'azienda (il master ha azienda_id NULL). La stessa matricola puo'
+        # esistere in aziende diverse -> unica solo dentro la stessa azienda.
         cur.execute(
             "CREATE TABLE IF NOT EXISTS utenti ("
-            " matricola TEXT PRIMARY KEY,"
+            " id SERIAL PRIMARY KEY,"
+            " azienda_id INTEGER,"
+            " matricola TEXT,"
             " password_hash TEXT,"
             " ruolo TEXT DEFAULT 'autista',"
             " attivo BOOLEAN DEFAULT TRUE,"
-            " creato TIMESTAMP DEFAULT NOW())"
+            " creato TIMESTAMP DEFAULT NOW(),"
+            " UNIQUE (azienda_id, matricola))"
         )
         # sessioni: il "gettone" (token) che identifica chi ha fatto il login
         cur.execute(
             "CREATE TABLE IF NOT EXISTS sessioni ("
             " token TEXT PRIMARY KEY,"
             " matricola TEXT,"
+            " azienda_id INTEGER,"
             " ruolo TEXT,"
             " creato TIMESTAMP DEFAULT NOW())"
         )
@@ -190,22 +199,29 @@ def init_db():
         )
         cur.execute(
             "CREATE TABLE IF NOT EXISTS matricole_valide ("
-            " matricola TEXT PRIMARY KEY,"
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " azienda_id INTEGER,"
+            " matricola TEXT,"
             " attiva INTEGER DEFAULT 1,"
-            " aggiornata TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            " aggiornata TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+            " UNIQUE (azienda_id, matricola))"
         )
         cur.execute(
             "CREATE TABLE IF NOT EXISTS utenti ("
-            " matricola TEXT PRIMARY KEY,"
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " azienda_id INTEGER,"
+            " matricola TEXT,"
             " password_hash TEXT,"
             " ruolo TEXT DEFAULT 'autista',"
             " attivo INTEGER DEFAULT 1,"
-            " creato TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            " creato TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+            " UNIQUE (azienda_id, matricola))"
         )
         cur.execute(
             "CREATE TABLE IF NOT EXISTS sessioni ("
             " token TEXT PRIMARY KEY,"
             " matricola TEXT,"
+            " azienda_id INTEGER,"
             " ruolo TEXT,"
             " creato TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
@@ -268,10 +284,11 @@ def data_valida(d):
         return False
 
 
-def registra_matricole(matricole):
-    """Aggiunge le matricole all'elenco di quelle valide (chi potra' registrarsi).
-    Se una matricola c'e' gia', la lascia com'e'. NON toglie mai nessuno
-    (i dimissionari li rimuove l'amministratore a mano)."""
+def registra_matricole(matricole, azienda_id):
+    """Aggiunge le matricole all'elenco valide DI QUELL'AZIENDA (se non ci sono).
+    NON toglie mai nessuno (i dimissionari li rimuove l'amministratore a mano)."""
+    if not azienda_id:
+        return
     puliti = [str(m).strip() for m in (matricole or []) if str(m).strip()]
     if not puliti:
         return
@@ -279,25 +296,28 @@ def registra_matricole(matricole):
     for m in puliti:
         try:
             if USA_POSTGRES:
-                cur.execute("INSERT INTO matricole_valide (matricola) VALUES (%s) "
-                            "ON CONFLICT (matricola) DO NOTHING", (m,))
+                cur.execute("INSERT INTO matricole_valide (azienda_id, matricola) VALUES (%s,%s) "
+                            "ON CONFLICT (azienda_id, matricola) DO NOTHING", (azienda_id, m))
             else:
-                cur.execute("INSERT OR IGNORE INTO matricole_valide (matricola) VALUES (?)", (m,))
+                cur.execute("INSERT OR IGNORE INTO matricole_valide (azienda_id, matricola) VALUES (?,?)",
+                            (azienda_id, m))
         except Exception as e:
             print("registra_matricole:", e)
     con.commit(); cur.close(); con.close()
 
 
-def matricola_e_valida(m):
-    """Vero se la matricola e' tra quelle valide e attive (puo' registrarsi)."""
+def matricola_e_valida(m, azienda_id):
+    """Vero se la matricola e' valida e attiva PER quell'azienda (puo' registrarsi)."""
     m = str(m or "").strip()
-    if not m:
+    if not m or not azienda_id:
         return False
     con = get_conn(); cur = con.cursor()
     if USA_POSTGRES:
-        cur.execute("SELECT 1 FROM matricole_valide WHERE matricola=%s AND attiva", (m,))
+        cur.execute("SELECT 1 FROM matricole_valide WHERE azienda_id=%s AND matricola=%s AND attiva",
+                    (azienda_id, m))
     else:
-        cur.execute("SELECT 1 FROM matricole_valide WHERE matricola=? AND attiva=1", (m,))
+        cur.execute("SELECT 1 FROM matricole_valide WHERE azienda_id=? AND matricola=? AND attiva=1",
+                    (azienda_id, m))
     ok = cur.fetchone() is not None
     cur.close(); con.close()
     return ok
@@ -313,11 +333,11 @@ def utente_corrente():
     if not token:
         return None
     con = get_conn(); cur = con.cursor()
-    cur.execute(f"SELECT matricola, ruolo FROM sessioni WHERE token = {PH}", (token,))
+    cur.execute(f"SELECT matricola, azienda_id, ruolo FROM sessioni WHERE token = {PH}", (token,))
     riga = cur.fetchone(); cur.close(); con.close()
     if not riga:
         return None
-    return {"matricola": riga[0], "ruolo": riga[1]}
+    return {"matricola": riga[0], "azienda_id": riga[1], "ruolo": riga[2]}
 
 
 # --- indirizzi base ---
@@ -520,8 +540,6 @@ def api_variazioni():
             con.rollback(); cur.close(); con.close()
             return jsonify({"stato": "esiste", "data": data}), 409
         cur.close(); con.close()
-        # ogni caricamento aggiorna da solo l'elenco delle matricole valide
-        registra_matricole(list(mappa.keys()) if isinstance(mappa, dict) else [])
         return jsonify({"stato": "salvato", "data": data}), 201
 
     # --- GET (senza data): elenca i giorni presenti ---
@@ -565,7 +583,6 @@ def api_variazioni_giorno(data):
                 (data, mappa_testo, caricato_da, adesso))
             stato = "creato"
         con.commit(); cur.close(); con.close()
-        registra_matricole(list(mappa.keys()) if isinstance(mappa, dict) else [])
         return jsonify({"stato": stato, "data": data})
 
     # --- GET: legge il giorno ---
@@ -682,16 +699,36 @@ def api_guasti_invia(id_client):
 @app.route("/api/matricole", methods=["GET", "POST"])
 def api_matricole():
     if request.method == "POST":
+        u = utente_corrente()
+        if not u or u["ruolo"] not in ("master", "azienda"):
+            return jsonify({"stato": "errore", "motivo": "serve un account master o azienda"}), 403
         dati = request.get_json(silent=True) or {}
+        # l'azienda usa la propria; il master indica quale
+        grezzo = u["azienda_id"] if u["ruolo"] == "azienda" else dati.get("azienda_id")
+        try:
+            azienda_id = int(grezzo)
+        except (TypeError, ValueError):
+            azienda_id = None
+        if not azienda_id:
+            return jsonify({"stato": "errore", "motivo": "manca l'azienda"}), 400
         elenco = dati.get("matricole") or []
-        registra_matricole(elenco)
-        return jsonify({"stato": "ok", "ricevute": len(elenco)})
+        registra_matricole(elenco, azienda_id)
+        return jsonify({"stato": "ok", "azienda_id": azienda_id, "ricevute": len(elenco)})
 
+    # GET: elenco delle matricole di una azienda (?azienda_id=)
+    try:
+        azienda_id = int(request.args.get("azienda_id"))
+    except (TypeError, ValueError):
+        azienda_id = None
+    if not azienda_id:
+        return jsonify({"quante": 0, "matricole": [], "nota": "indica ?azienda_id="})
     con = get_conn(); cur = con.cursor()
     if USA_POSTGRES:
-        cur.execute("SELECT matricola FROM matricole_valide WHERE attiva ORDER BY matricola")
+        cur.execute("SELECT matricola FROM matricole_valide WHERE azienda_id=%s AND attiva ORDER BY matricola",
+                    (azienda_id,))
     else:
-        cur.execute("SELECT matricola FROM matricole_valide WHERE attiva=1 ORDER BY matricola")
+        cur.execute("SELECT matricola FROM matricole_valide WHERE azienda_id=? AND attiva=1 ORDER BY matricola",
+                    (azienda_id,))
     righe = cur.fetchall(); cur.close(); con.close()
     matricole = [r[0] for r in righe]
     return jsonify({"quante": len(matricole), "matricole": matricole})
@@ -703,31 +740,38 @@ def api_matricole():
 @app.route("/api/registrati", methods=["POST"])
 def api_registrati():
     dati = request.get_json(silent=True) or {}
+    try:
+        azienda_id = int(dati.get("azienda_id"))
+    except (TypeError, ValueError):
+        azienda_id = None
     matricola = str(dati.get("matricola") or "").strip()
     password = str(dati.get("password") or "")
 
+    if not azienda_id:
+        return jsonify({"stato": "errore", "motivo": "scegli l'azienda"}), 400
     if not matricola:
         return jsonify({"stato": "errore", "motivo": "manca la matricola"}), 400
     if len(password) < 6:
         return jsonify({"stato": "errore",
                         "motivo": "la password deve avere almeno 6 caratteri"}), 400
-    # la matricola deve risultare tra i dipendenti (elenco valide)
-    if not matricola_e_valida(matricola):
+    # la matricola deve risultare tra i dipendenti DI QUELL'AZIENDA
+    if not matricola_e_valida(matricola, azienda_id):
         return jsonify({"stato": "errore",
-                        "motivo": "matricola non riconosciuta (non risulta tra i dipendenti)"}), 403
+                        "motivo": "matricola non riconosciuta per questa azienda"}), 403
 
     con = get_conn(); cur = con.cursor()
-    cur.execute(f"SELECT matricola FROM utenti WHERE matricola={PH}", (matricola,))
+    cur.execute(f"SELECT id FROM utenti WHERE azienda_id={PH} AND matricola={PH}", (azienda_id, matricola))
     if cur.fetchone():
         cur.close(); con.close()
         return jsonify({"stato": "gia_registrato",
-                        "motivo": "questa matricola ha gia' un account"}), 409
+                        "motivo": "questa matricola ha gia' un account in questa azienda"}), 409
     # la password NON viene mai salvata leggibile: salviamo solo la sua "impronta"
     ph = generate_password_hash(password)
-    cur.execute(f"INSERT INTO utenti (matricola, password_hash, ruolo) VALUES ({PH},{PH},{PH})",
-                (matricola, ph, "autista"))
+    cur.execute(f"INSERT INTO utenti (azienda_id, matricola, password_hash, ruolo) "
+                f"VALUES ({PH},{PH},{PH},'autista')", (azienda_id, matricola, ph))
     con.commit(); cur.close(); con.close()
-    return jsonify({"stato": "registrato", "matricola": matricola, "ruolo": "autista"}), 201
+    return jsonify({"stato": "registrato", "matricola": matricola,
+                    "azienda_id": azienda_id, "ruolo": "autista"}), 201
 
 
 # --- PAGINETTA DI PROVA della registrazione ---
@@ -750,18 +794,26 @@ PAGINA_PROVA_REGISTRAZIONE = """
 </head>
 <body>
   <h1>Prova: crea un account</h1>
-  <p>Funziona solo se la matricola risulta tra i dipendenti (elenco matricole valide).</p>
+  <p>Scegli l'azienda e inserisci una matricola che risulti tra i suoi dipendenti.</p>
+  <div><label>Azienda</label><select id="az"></select></div>
   <div><label>Matricola</label><input id="matr" placeholder="es. 111"></div>
   <div><label>Password</label><input id="pwd" type="password" placeholder="almeno 6 caratteri"></div>
   <button onclick="registrati()">Registrati</button>
   <p id="esito"></p>
 
   <script>
+    async function caricaAziende(){
+      const r = await fetch('/api/aziende'); const d = await r.json();
+      const s = document.getElementById('az'); s.innerHTML = '';
+      (d.aziende||[]).forEach(function(a){ const o=document.createElement('option'); o.value=a.id; o.textContent=a.nome; s.appendChild(o); });
+    }
+    caricaAziende();
     async function registrati(){
       const r = await fetch('/api/registrati', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          azienda_id: document.getElementById('az').value,
           matricola: document.getElementById('matr').value.trim(),
           password: document.getElementById('pwd').value
         })
@@ -769,7 +821,7 @@ PAGINA_PROVA_REGISTRAZIONE = """
       const d = await r.json();
       const e = document.getElementById('esito');
       if (d.stato === 'registrato') e.textContent = '✓ Account creato per la matricola ' + d.matricola + ' (ruolo: ' + d.ruolo + ')';
-      else if (d.stato === 'gia_registrato') e.textContent = 'ℹ Questa matricola ha già un account';
+      else if (d.stato === 'gia_registrato') e.textContent = 'ℹ ' + (d.motivo || 'ha già un account');
       else e.textContent = '⚠ ' + (d.motivo || 'errore');
     }
   </script>
@@ -794,24 +846,33 @@ def api_login():
     if not matricola or not password:
         return jsonify({"stato": "errore", "motivo": "servono matricola e password"}), 400
 
+    try:
+        azienda_id = int(dati.get("azienda_id"))   # assente/None = login del master
+    except (TypeError, ValueError):
+        azienda_id = None
     con = get_conn(); cur = con.cursor()
-    cur.execute(f"SELECT password_hash, ruolo, attivo FROM utenti WHERE matricola = {PH}", (matricola,))
+    if azienda_id:
+        cur.execute(f"SELECT password_hash, ruolo, attivo, azienda_id FROM utenti "
+                    f"WHERE azienda_id={PH} AND matricola={PH}", (azienda_id, matricola))
+    else:
+        cur.execute(f"SELECT password_hash, ruolo, attivo, azienda_id FROM utenti "
+                    f"WHERE azienda_id IS NULL AND matricola={PH}", (matricola,))
     riga = cur.fetchone()
-    # stessa risposta se la matricola non esiste o la password e' sbagliata
-    # (non riveliamo QUALE dei due e' sbagliato: e' piu' sicuro)
+    # stessa risposta se non esiste o la password e' sbagliata (piu' sicuro)
     if not riga or not check_password_hash(riga[0] or "", password):
         cur.close(); con.close()
-        return jsonify({"stato": "errore", "motivo": "matricola o password sbagliati"}), 401
+        return jsonify({"stato": "errore", "motivo": "dati di accesso sbagliati"}), 401
     if not riga[2]:
         cur.close(); con.close()
         return jsonify({"stato": "errore", "motivo": "account disattivato"}), 403
 
-    ruolo = riga[1] or "autista"
+    ruolo = riga[1] or "autista"; az = riga[3]
     token = secrets.token_urlsafe(24)   # gettone casuale, difficile da indovinare
-    cur.execute(f"INSERT INTO sessioni (token, matricola, ruolo) VALUES ({PH},{PH},{PH})",
-                (token, matricola, ruolo))
+    cur.execute(f"INSERT INTO sessioni (token, matricola, azienda_id, ruolo) VALUES ({PH},{PH},{PH},{PH})",
+                (token, matricola, az, ruolo))
     con.commit(); cur.close(); con.close()
-    return jsonify({"stato": "ok", "token": token, "matricola": matricola, "ruolo": ruolo})
+    return jsonify({"stato": "ok", "token": token, "matricola": matricola,
+                    "azienda_id": az, "ruolo": ruolo})
 
 
 # Chi sono? (serve il gettone). Utile per verificare che il login "regga".
@@ -820,7 +881,8 @@ def api_io():
     u = utente_corrente()
     if not u:
         return jsonify({"stato": "errore", "motivo": "non hai fatto il login"}), 401
-    return jsonify({"stato": "ok", "matricola": u["matricola"], "ruolo": u["ruolo"]})
+    return jsonify({"stato": "ok", "matricola": u["matricola"],
+                    "azienda_id": u["azienda_id"], "ruolo": u["ruolo"]})
 
 
 # --- PAGINETTA DI PROVA del login ---
@@ -844,7 +906,8 @@ PAGINA_PROVA_LOGIN = """
 </head>
 <body>
   <h1>Prova: entra nel tuo account</h1>
-  <div><label>Matricola</label><input id="matr" placeholder="es. 111"></div>
+  <div><label>Azienda</label><select id="az"><option value="">— Master (nessuna azienda) —</option></select></div>
+  <div><label>Matricola</label><input id="matr" placeholder="es. 111 (o nome master)"></div>
   <div><label>Password</label><input id="pwd" type="password"></div>
   <button onclick="entra()">Entra</button>
   <button onclick="chiSono()">Chi sono?</button>
@@ -853,13 +916,19 @@ PAGINA_PROVA_LOGIN = """
 
   <script>
     let TOKEN = '';
+    async function caricaAziende(){
+      const r = await fetch('/api/aziende'); const d = await r.json();
+      const s = document.getElementById('az');
+      (d.aziende||[]).forEach(function(a){ const o=document.createElement('option'); o.value=a.id; o.textContent=a.nome; s.appendChild(o); });
+    }
+    caricaAziende();
     async function entra(){
+      const az = document.getElementById('az').value;
+      const body = { matricola: document.getElementById('matr').value.trim(), password: document.getElementById('pwd').value };
+      if (az) body.azienda_id = az;
       const r = await fetch('/api/login', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          matricola: document.getElementById('matr').value.trim(),
-          password: document.getElementById('pwd').value
-        })
+        body: JSON.stringify(body)
       });
       const d = await r.json();
       const e = document.getElementById('esito');
@@ -912,13 +981,13 @@ def api_setup_master():
     if cur.fetchone():
         cur.close(); con.close()
         return jsonify({"stato": "errore", "motivo": "esiste gia' un account master"}), 409
-    cur.execute(f"SELECT 1 FROM utenti WHERE matricola={PH}", (utente,))
+    cur.execute(f"SELECT 1 FROM utenti WHERE azienda_id IS NULL AND matricola={PH}", (utente,))
     if cur.fetchone():
         cur.close(); con.close()
         return jsonify({"stato": "errore", "motivo": "nome utente gia' in uso"}), 409
     ph = generate_password_hash(password)
-    cur.execute(f"INSERT INTO utenti (matricola, password_hash, ruolo) VALUES ({PH},{PH},'master')",
-                (utente, ph))
+    cur.execute(f"INSERT INTO utenti (azienda_id, matricola, password_hash, ruolo) "
+                f"VALUES (NULL,{PH},{PH},'master')", (utente, ph))
     con.commit(); cur.close(); con.close()
     return jsonify({"stato": "ok", "utente": utente, "ruolo": "master"}), 201
 
@@ -1046,6 +1115,15 @@ PAGINA_PROVA_MASTER = """
     <ul id="lista"></ul>
   </div>
 
+  <div class="box">
+    <h2>3) Matricole valide di un'azienda</h2>
+    <div><label>Azienda</label><select id="azSel"></select></div>
+    <div><label>Matricole</label><input id="matr" placeholder="es. 111, 222, 333 (separate da virgola)" style="width:70%"></div>
+    <button onclick="caricaMatricole()">Carica matricole</button>
+    <button onclick="vediMatricole()">Vedi matricole</button>
+    <ul id="listaMatr"></ul>
+  </div>
+
   <p id="esito"></p>
 
   <script>
@@ -1069,7 +1147,26 @@ PAGINA_PROVA_MASTER = """
     async function elenca(){
       const r = await fetch('/api/aziende'); const d = await r.json();
       const ul = document.getElementById('lista'); ul.innerHTML='';
-      (d.aziende||[]).forEach(function(a){ const li=document.createElement('li'); li.textContent = '#'+a.id+' — '+a.nome; ul.appendChild(li); });
+      const sel = document.getElementById('azSel'); sel.innerHTML='';
+      (d.aziende||[]).forEach(function(a){
+        const li=document.createElement('li'); li.textContent = '#'+a.id+' — '+a.nome; ul.appendChild(li);
+        const o=document.createElement('option'); o.value=a.id; o.textContent=a.nome; sel.appendChild(o);
+      });
+    }
+    async function caricaMatricole(){
+      if (!TOKEN) { document.getElementById('esito').textContent = 'Prima entra come master'; return; }
+      const matr = document.getElementById('matr').value.split(',').map(function(x){return x.trim();}).filter(function(x){return x;});
+      const r = await fetch('/api/matricole', { method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+        body: JSON.stringify({ azienda_id: document.getElementById('azSel').value, matricole: matr }) });
+      const d = await r.json();
+      document.getElementById('esito').textContent = (d.stato==='ok') ? ('✓ '+d.ricevute+' matricole caricate') : ('⚠ '+(d.motivo||'errore'));
+      document.getElementById('matr').value=''; vediMatricole();
+    }
+    async function vediMatricole(){
+      const az = document.getElementById('azSel').value;
+      const r = await fetch('/api/matricole?azienda_id='+az); const d = await r.json();
+      const ul = document.getElementById('listaMatr'); ul.innerHTML='';
+      (d.matricole||[]).forEach(function(m){ const li=document.createElement('li'); li.textContent=m; ul.appendChild(li); });
     }
   </script>
 </body>
