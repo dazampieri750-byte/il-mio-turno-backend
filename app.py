@@ -87,6 +87,18 @@ def init_db():
             " caricato_da TEXT,"
             " quando TIMESTAMP DEFAULT NOW())"
         )
+        # guasti: lista di segnalazioni (nessun blocco). id_client UNIQUE = anti-doppione
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS guasti ("
+            " id SERIAL PRIMARY KEY,"
+            " id_client TEXT UNIQUE,"
+            " mezzo TEXT,"
+            " data TEXT,"
+            " tipo TEXT,"
+            " nota TEXT,"
+            " segnalato_da TEXT,"
+            " quando TIMESTAMP DEFAULT NOW())"
+        )
     else:
         cur.execute(
             "CREATE TABLE IF NOT EXISTS messaggi ("
@@ -100,6 +112,17 @@ def init_db():
             " data TEXT UNIQUE,"
             " mappa TEXT,"
             " caricato_da TEXT,"
+            " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS guasti ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " id_client TEXT UNIQUE,"
+            " mezzo TEXT,"
+            " data TEXT,"
+            " tipo TEXT,"
+            " nota TEXT,"
+            " segnalato_da TEXT,"
             " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
     con.commit(); cur.close(); con.close()
@@ -400,6 +423,65 @@ def api_variazioni_giorno(data):
     })
 
 
+# =====================================================================
+#  GUASTI — segnalazioni guasti mezzi (lista condivisa, senza blocco)
+#   GET  = dammi tutte le segnalazioni
+#   POST = aggiungi una segnalazione {mezzo, data, tipo, nota, segnalato_da, id}
+#  L'id (generato dall'app) serve a NON registrare due volte lo stesso guasto.
+# =====================================================================
+
+@app.route("/api/guasti", methods=["GET", "POST"])
+def api_guasti():
+
+    # --- POST: aggiungi una segnalazione ---
+    if request.method == "POST":
+        dati = request.get_json(silent=True) or {}
+        mezzo = str(dati.get("mezzo") or "").strip()
+        data = str(dati.get("data") or "").strip()
+        tipo = str(dati.get("tipo") or "").strip()
+        nota = str(dati.get("nota") or "").strip()
+        segnalato_da = str(dati.get("segnalato_da") or "").strip()
+        id_client = str(dati.get("id") or "").strip()
+
+        if not mezzo:
+            return jsonify({"stato": "errore", "motivo": "manca il mezzo"}), 400
+        if not data_valida(data):
+            return jsonify({"stato": "errore",
+                            "motivo": "data mancante o non valida (aaaa-mm-gg)"}), 400
+        if not id_client:   # se l'app non manda un id, lo creiamo noi
+            id_client = datetime.utcnow().strftime("g%Y%m%d%H%M%S%f")
+
+        con = get_conn(); cur = con.cursor()
+        # anti-doppione: se questo id c'e' gia', non lo reinserisco
+        cur.execute(f"SELECT id FROM guasti WHERE id_client = {PH}", (id_client,))
+        if cur.fetchone():
+            cur.close(); con.close()
+            return jsonify({"stato": "gia_presente", "id": id_client})
+        try:
+            cur.execute(
+                f"INSERT INTO guasti (id_client, mezzo, data, tipo, nota, segnalato_da) "
+                f"VALUES ({PH},{PH},{PH},{PH},{PH},{PH})",
+                (id_client, mezzo, data, tipo, nota, segnalato_da))
+            con.commit()
+        except Exception:
+            con.rollback(); cur.close(); con.close()
+            return jsonify({"stato": "gia_presente", "id": id_client})
+        cur.close(); con.close()
+        return jsonify({"stato": "salvato", "id": id_client}), 201
+
+    # --- GET: elenca tutte le segnalazioni ---
+    con = get_conn(); cur = con.cursor()
+    cur.execute("SELECT id_client, mezzo, data, tipo, nota, segnalato_da, quando "
+                "FROM guasti ORDER BY data DESC, id DESC")
+    righe = cur.fetchall(); cur.close(); con.close()
+    guasti = [
+        {"id": r[0], "mezzo": r[1], "data": r[2], "tipo": r[3],
+         "nota": r[4], "segnalato_da": r[5], "quando": fmt_quando(r[6])}
+        for r in righe
+    ]
+    return jsonify({"quanti": len(guasti), "guasti": guasti})
+
+
 # --- PAGINETTA DI PROVA del registro variazioni (servita dal server) ---
 # La apri su /prova-registro. Scegli una data, metti una matricola e un
 # turno di prova, e premi Salva. Riprova lo stesso giorno: vedrai il BLOCCO.
@@ -504,6 +586,84 @@ PAGINA_PROVA_REGISTRO = """
 @app.route("/prova-registro")
 def prova_registro():
     return PAGINA_PROVA_REGISTRO
+
+
+# --- PAGINETTA DI PROVA dei guasti (servita dal server) ---
+PAGINA_PROVA_GUASTI = """
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prova guasti</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 640px;
+           margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 22px; }
+    label { display: inline-block; width: 95px; }
+    input { padding: 8px; font-size: 16px; margin: 4px 0; }
+    button { padding: 9px 14px; font-size: 15px; cursor: pointer; margin: 6px 6px 6px 0; }
+    #esito { min-height: 22px; font-weight: bold; }
+    pre { background: #f4f4f4; padding: 12px; border-radius: 6px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h1>Prova: segnalazione guasti</h1>
+  <p>Segnala un guasto di un mezzo. Ogni segnalazione si aggiunge alla lista
+     condivisa (niente blocco).</p>
+
+  <div><label>Mezzo</label><input id="mezzo" placeholder="es. 1234"></div>
+  <div><label>Data</label><input type="date" id="data"></div>
+  <div><label>Tipo</label><input id="tipo" placeholder="es. Freni"></div>
+  <div><label>Nota</label><input id="nota" placeholder="descrizione (facoltativa)"></div>
+  <div><label>Matricola</label><input id="matr" placeholder="chi segnala"></div>
+
+  <button onclick="segnala()">Segnala guasto</button>
+  <button onclick="elenca()">Elenca i guasti</button>
+
+  <p id="esito"></p>
+  <pre id="out"></pre>
+
+  <script>
+    function mostra(o){ document.getElementById('out').textContent = JSON.stringify(o, null, 2); }
+
+    async function segnala(){
+      const g = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2,6),
+        mezzo: document.getElementById('mezzo').value.trim(),
+        data: document.getElementById('data').value,
+        tipo: document.getElementById('tipo').value.trim(),
+        nota: document.getElementById('nota').value.trim(),
+        segnalato_da: document.getElementById('matr').value.trim()
+      };
+      const r = await fetch('/api/guasti', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(g)
+      });
+      const d = await r.json();
+      const e = document.getElementById('esito');
+      if (d.stato === 'salvato') e.textContent = '✓ Guasto segnalato per il mezzo ' + g.mezzo;
+      else if (d.stato === 'gia_presente') e.textContent = 'ℹ Questa segnalazione era già registrata';
+      else e.textContent = '⚠ ' + (d.motivo || 'errore');
+      mostra(d);
+    }
+
+    async function elenca(){
+      const r = await fetch('/api/guasti');
+      const d = await r.json();
+      document.getElementById('esito').textContent = 'Segnalazioni totali: ' + d.quanti;
+      mostra(d);
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/prova-guasti")
+def prova_guasti():
+    return PAGINA_PROVA_GUASTI
 
 
 # crea la tabella all'avvio (vale anche quando gira con gunicorn su Render)
