@@ -12,9 +12,11 @@
 
 import os
 import json                                  # per impacchettare/spacchettare i dati JSON
+import secrets                               # per generare i "gettoni" (token) di accesso
 from datetime import datetime
 from zoneinfo import ZoneInfo                # per convertire l'ora UTC in ora italiana
 from flask import Flask, jsonify, request, Response   # request = legge i dati "nel pacco"
+from werkzeug.security import generate_password_hash, check_password_hash  # password protette
 
 # fuso orario italiano (gestisce da solo ora legale/solare)
 FUSO_ITALIA = ZoneInfo("Europe/Rome")
@@ -99,6 +101,45 @@ def init_db():
             " segnalato_da TEXT,"
             " quando TIMESTAMP DEFAULT NOW())"
         )
+        # diario dei mezzi usati (storico personale per matricola)
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS mezzi_usati ("
+            " id SERIAL PRIMARY KEY,"
+            " id_client TEXT UNIQUE,"
+            " matricola TEXT,"
+            " data TEXT,"
+            " turno TEXT,"
+            " pezzo TEXT,"
+            " ora_inizio TEXT,"
+            " ora_fine TEXT,"
+            " mezzo TEXT,"
+            " nota TEXT,"
+            " quando TIMESTAMP DEFAULT NOW())"
+        )
+        # elenco matricole valide (chi puo' registrarsi); si popola da solo
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS matricole_valide ("
+            " matricola TEXT PRIMARY KEY,"
+            " attiva BOOLEAN DEFAULT TRUE,"
+            " aggiornata TIMESTAMP DEFAULT NOW())"
+        )
+        # utenti registrati (password SEMPRE hashata, mai in chiaro)
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS utenti ("
+            " matricola TEXT PRIMARY KEY,"
+            " password_hash TEXT,"
+            " ruolo TEXT DEFAULT 'autista',"
+            " attivo BOOLEAN DEFAULT TRUE,"
+            " creato TIMESTAMP DEFAULT NOW())"
+        )
+        # sessioni: il "gettone" (token) che identifica chi ha fatto il login
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS sessioni ("
+            " token TEXT PRIMARY KEY,"
+            " matricola TEXT,"
+            " ruolo TEXT,"
+            " creato TIMESTAMP DEFAULT NOW())"
+        )
     else:
         cur.execute(
             "CREATE TABLE IF NOT EXISTS messaggi ("
@@ -125,6 +166,57 @@ def init_db():
             " segnalato_da TEXT,"
             " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS mezzi_usati ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " id_client TEXT UNIQUE,"
+            " matricola TEXT,"
+            " data TEXT,"
+            " turno TEXT,"
+            " pezzo TEXT,"
+            " ora_inizio TEXT,"
+            " ora_fine TEXT,"
+            " mezzo TEXT,"
+            " nota TEXT,"
+            " quando TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS matricole_valide ("
+            " matricola TEXT PRIMARY KEY,"
+            " attiva INTEGER DEFAULT 1,"
+            " aggiornata TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS utenti ("
+            " matricola TEXT PRIMARY KEY,"
+            " password_hash TEXT,"
+            " ruolo TEXT DEFAULT 'autista',"
+            " attivo INTEGER DEFAULT 1,"
+            " creato TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS sessioni ("
+            " token TEXT PRIMARY KEY,"
+            " matricola TEXT,"
+            " ruolo TEXT,"
+            " creato TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+    # migrazione: aggiunge ai guasti le colonne di INVIO anche se la tabella
+    # esisteva gia' (cosi' non serve ricreare il database)
+    nuove_colonne = [("stato", "TEXT DEFAULT 'nuovo'"),
+                     ("inviato_quando", "TIMESTAMP"),
+                     ("inviato_da", "TEXT")]
+    for col, tipo in nuove_colonne:
+        try:
+            if USA_POSTGRES:
+                cur.execute(f"ALTER TABLE guasti ADD COLUMN IF NOT EXISTS {col} {tipo}")
+            else:
+                cur.execute("PRAGMA table_info(guasti)")
+                esistenti = [r[1] for r in cur.fetchall()]
+                if col not in esistenti:
+                    cur.execute(f"ALTER TABLE guasti ADD COLUMN {col} {tipo}")
+        except Exception as e:
+            print("migrazione guasti:", e)
     con.commit(); cur.close(); con.close()
 
 
@@ -159,6 +251,58 @@ def data_valida(d):
         return True
     except (ValueError, TypeError):
         return False
+
+
+def registra_matricole(matricole):
+    """Aggiunge le matricole all'elenco di quelle valide (chi potra' registrarsi).
+    Se una matricola c'e' gia', la lascia com'e'. NON toglie mai nessuno
+    (i dimissionari li rimuove l'amministratore a mano)."""
+    puliti = [str(m).strip() for m in (matricole or []) if str(m).strip()]
+    if not puliti:
+        return
+    con = get_conn(); cur = con.cursor()
+    for m in puliti:
+        try:
+            if USA_POSTGRES:
+                cur.execute("INSERT INTO matricole_valide (matricola) VALUES (%s) "
+                            "ON CONFLICT (matricola) DO NOTHING", (m,))
+            else:
+                cur.execute("INSERT OR IGNORE INTO matricole_valide (matricola) VALUES (?)", (m,))
+        except Exception as e:
+            print("registra_matricole:", e)
+    con.commit(); cur.close(); con.close()
+
+
+def matricola_e_valida(m):
+    """Vero se la matricola e' tra quelle valide e attive (puo' registrarsi)."""
+    m = str(m or "").strip()
+    if not m:
+        return False
+    con = get_conn(); cur = con.cursor()
+    if USA_POSTGRES:
+        cur.execute("SELECT 1 FROM matricole_valide WHERE matricola=%s AND attiva", (m,))
+    else:
+        cur.execute("SELECT 1 FROM matricole_valide WHERE matricola=? AND attiva=1", (m,))
+    ok = cur.fetchone() is not None
+    cur.close(); con.close()
+    return ok
+
+
+def utente_corrente():
+    """Chi ha fatto il login? Legge il 'gettone' (token) dalla richiesta e
+    ritorna {matricola, ruolo}, oppure None se non c'e' o non e' valido."""
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "").strip() if auth else ""
+    if not token:
+        token = (request.args.get("token") or "").strip()   # comodo per le prove nel browser
+    if not token:
+        return None
+    con = get_conn(); cur = con.cursor()
+    cur.execute(f"SELECT matricola, ruolo FROM sessioni WHERE token = {PH}", (token,))
+    riga = cur.fetchone(); cur.close(); con.close()
+    if not riga:
+        return None
+    return {"matricola": riga[0], "ruolo": riga[1]}
 
 
 # --- indirizzi base ---
@@ -361,6 +505,8 @@ def api_variazioni():
             con.rollback(); cur.close(); con.close()
             return jsonify({"stato": "esiste", "data": data}), 409
         cur.close(); con.close()
+        # ogni caricamento aggiorna da solo l'elenco delle matricole valide
+        registra_matricole(list(mappa.keys()) if isinstance(mappa, dict) else [])
         return jsonify({"stato": "salvato", "data": data}), 201
 
     # --- GET (senza data): elenca i giorni presenti ---
@@ -404,6 +550,7 @@ def api_variazioni_giorno(data):
                 (data, mappa_testo, caricato_da, adesso))
             stato = "creato"
         con.commit(); cur.close(); con.close()
+        registra_matricole(list(mappa.keys()) if isinstance(mappa, dict) else [])
         return jsonify({"stato": stato, "data": data})
 
     # --- GET: legge il giorno ---
@@ -469,17 +616,263 @@ def api_guasti():
         cur.close(); con.close()
         return jsonify({"stato": "salvato", "id": id_client}), 201
 
-    # --- GET: elenca tutte le segnalazioni ---
+    # --- GET: elenca tutte le segnalazioni (con stato di invio) ---
     con = get_conn(); cur = con.cursor()
-    cur.execute("SELECT id_client, mezzo, data, tipo, nota, segnalato_da, quando "
+    cur.execute("SELECT id_client, mezzo, data, tipo, nota, segnalato_da, quando, "
+                "stato, inviato_quando, inviato_da "
                 "FROM guasti ORDER BY data DESC, id DESC")
     righe = cur.fetchall(); cur.close(); con.close()
     guasti = [
         {"id": r[0], "mezzo": r[1], "data": r[2], "tipo": r[3],
-         "nota": r[4], "segnalato_da": r[5], "quando": fmt_quando(r[6])}
+         "nota": r[4], "segnalato_da": r[5],
+         "quando": fmt_quando(r[6]),                                   # data segnalazione
+         "stato": r[7] or "nuovo",
+         "inviato_quando": fmt_quando(r[8]) if r[8] else None,         # data invio officina
+         "inviato_da": r[9] or ""}
         for r in righe
     ]
     return jsonify({"quanti": len(guasti), "guasti": guasti})
+
+
+# --- INVIA un guasto all'officina (per ora segna solo lo stato; il canale
+#     reale verso il gestionale si collega in futuro) ---
+@app.route("/api/guasti/<id_client>/invia", methods=["POST"])
+def api_guasti_invia(id_client):
+    dati = request.get_json(silent=True) or {}
+    inviato_da = str(dati.get("inviato_da") or "").strip()
+    adesso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    con = get_conn(); cur = con.cursor()
+    cur.execute(f"SELECT stato FROM guasti WHERE id_client = {PH}", (id_client,))
+    riga = cur.fetchone()
+    if not riga:
+        cur.close(); con.close()
+        return jsonify({"stato": "errore", "motivo": "guasto non trovato"}), 404
+    if (riga[0] or "") == "inviato":
+        cur.close(); con.close()
+        return jsonify({"stato": "gia_inviato", "id": id_client})
+    cur.execute(
+        f"UPDATE guasti SET stato='inviato', inviato_quando={PH}, inviato_da={PH} "
+        f"WHERE id_client={PH}",
+        (adesso, inviato_da, id_client))
+    con.commit(); cur.close(); con.close()
+    return jsonify({"stato": "inviato", "id": id_client})
+
+
+# =====================================================================
+#  MATRICOLE VALIDE — l'elenco di chi potra' registrarsi.
+#   GET  = vedi l'elenco
+#   POST {matricole:[...]} = aggiungi a mano un elenco (es. caricamento iniziale)
+#  Si aggiorna anche DA SOLO ad ogni caricamento di variazioni.
+# =====================================================================
+@app.route("/api/matricole", methods=["GET", "POST"])
+def api_matricole():
+    if request.method == "POST":
+        dati = request.get_json(silent=True) or {}
+        elenco = dati.get("matricole") or []
+        registra_matricole(elenco)
+        return jsonify({"stato": "ok", "ricevute": len(elenco)})
+
+    con = get_conn(); cur = con.cursor()
+    if USA_POSTGRES:
+        cur.execute("SELECT matricola FROM matricole_valide WHERE attiva ORDER BY matricola")
+    else:
+        cur.execute("SELECT matricola FROM matricole_valide WHERE attiva=1 ORDER BY matricola")
+    righe = cur.fetchall(); cur.close(); con.close()
+    matricole = [r[0] for r in righe]
+    return jsonify({"quante": len(matricole), "matricole": matricole})
+
+
+# =====================================================================
+#  ACCOUNT — registrazione (matricola valida + password protetta)
+# =====================================================================
+@app.route("/api/registrati", methods=["POST"])
+def api_registrati():
+    dati = request.get_json(silent=True) or {}
+    matricola = str(dati.get("matricola") or "").strip()
+    password = str(dati.get("password") or "")
+
+    if not matricola:
+        return jsonify({"stato": "errore", "motivo": "manca la matricola"}), 400
+    if len(password) < 6:
+        return jsonify({"stato": "errore",
+                        "motivo": "la password deve avere almeno 6 caratteri"}), 400
+    # la matricola deve risultare tra i dipendenti (elenco valide)
+    if not matricola_e_valida(matricola):
+        return jsonify({"stato": "errore",
+                        "motivo": "matricola non riconosciuta (non risulta tra i dipendenti)"}), 403
+
+    con = get_conn(); cur = con.cursor()
+    cur.execute(f"SELECT matricola FROM utenti WHERE matricola={PH}", (matricola,))
+    if cur.fetchone():
+        cur.close(); con.close()
+        return jsonify({"stato": "gia_registrato",
+                        "motivo": "questa matricola ha gia' un account"}), 409
+    # la password NON viene mai salvata leggibile: salviamo solo la sua "impronta"
+    ph = generate_password_hash(password)
+    cur.execute(f"INSERT INTO utenti (matricola, password_hash, ruolo) VALUES ({PH},{PH},{PH})",
+                (matricola, ph, "autista"))
+    con.commit(); cur.close(); con.close()
+    return jsonify({"stato": "registrato", "matricola": matricola, "ruolo": "autista"}), 201
+
+
+# --- PAGINETTA DI PROVA della registrazione ---
+PAGINA_PROVA_REGISTRAZIONE = """
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prova registrazione</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 480px;
+           margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 22px; }
+    label { display: inline-block; width: 90px; }
+    input { padding: 9px; font-size: 16px; margin: 5px 0; width: 60%; }
+    button { padding: 10px 16px; font-size: 15px; cursor: pointer; margin-top: 8px; }
+    #esito { min-height: 22px; font-weight: bold; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Prova: crea un account</h1>
+  <p>Funziona solo se la matricola risulta tra i dipendenti (elenco matricole valide).</p>
+  <div><label>Matricola</label><input id="matr" placeholder="es. 111"></div>
+  <div><label>Password</label><input id="pwd" type="password" placeholder="almeno 6 caratteri"></div>
+  <button onclick="registrati()">Registrati</button>
+  <p id="esito"></p>
+
+  <script>
+    async function registrati(){
+      const r = await fetch('/api/registrati', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          matricola: document.getElementById('matr').value.trim(),
+          password: document.getElementById('pwd').value
+        })
+      });
+      const d = await r.json();
+      const e = document.getElementById('esito');
+      if (d.stato === 'registrato') e.textContent = '✓ Account creato per la matricola ' + d.matricola + ' (ruolo: ' + d.ruolo + ')';
+      else if (d.stato === 'gia_registrato') e.textContent = 'ℹ Questa matricola ha già un account';
+      else e.textContent = '⚠ ' + (d.motivo || 'errore');
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/prova-registrazione")
+def prova_registrazione():
+    return PAGINA_PROVA_REGISTRAZIONE
+
+
+# =====================================================================
+#  LOGIN — verifica password e rilascia un "gettone" (token)
+# =====================================================================
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    dati = request.get_json(silent=True) or {}
+    matricola = str(dati.get("matricola") or "").strip()
+    password = str(dati.get("password") or "")
+    if not matricola or not password:
+        return jsonify({"stato": "errore", "motivo": "servono matricola e password"}), 400
+
+    con = get_conn(); cur = con.cursor()
+    cur.execute(f"SELECT password_hash, ruolo, attivo FROM utenti WHERE matricola = {PH}", (matricola,))
+    riga = cur.fetchone()
+    # stessa risposta se la matricola non esiste o la password e' sbagliata
+    # (non riveliamo QUALE dei due e' sbagliato: e' piu' sicuro)
+    if not riga or not check_password_hash(riga[0] or "", password):
+        cur.close(); con.close()
+        return jsonify({"stato": "errore", "motivo": "matricola o password sbagliati"}), 401
+    if not riga[2]:
+        cur.close(); con.close()
+        return jsonify({"stato": "errore", "motivo": "account disattivato"}), 403
+
+    ruolo = riga[1] or "autista"
+    token = secrets.token_urlsafe(24)   # gettone casuale, difficile da indovinare
+    cur.execute(f"INSERT INTO sessioni (token, matricola, ruolo) VALUES ({PH},{PH},{PH})",
+                (token, matricola, ruolo))
+    con.commit(); cur.close(); con.close()
+    return jsonify({"stato": "ok", "token": token, "matricola": matricola, "ruolo": ruolo})
+
+
+# Chi sono? (serve il gettone). Utile per verificare che il login "regga".
+@app.route("/api/io")
+def api_io():
+    u = utente_corrente()
+    if not u:
+        return jsonify({"stato": "errore", "motivo": "non hai fatto il login"}), 401
+    return jsonify({"stato": "ok", "matricola": u["matricola"], "ruolo": u["ruolo"]})
+
+
+# --- PAGINETTA DI PROVA del login ---
+PAGINA_PROVA_LOGIN = """
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prova login</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 480px;
+           margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 22px; }
+    label { display: inline-block; width: 90px; }
+    input { padding: 9px; font-size: 16px; margin: 5px 0; width: 60%; }
+    button { padding: 10px 16px; font-size: 15px; cursor: pointer; margin: 8px 6px 0 0; }
+    #esito { min-height: 22px; font-weight: bold; margin-top: 12px; }
+    code { background:#eee; padding:1px 5px; border-radius:4px; word-break:break-all; }
+  </style>
+</head>
+<body>
+  <h1>Prova: entra nel tuo account</h1>
+  <div><label>Matricola</label><input id="matr" placeholder="es. 111"></div>
+  <div><label>Password</label><input id="pwd" type="password"></div>
+  <button onclick="entra()">Entra</button>
+  <button onclick="chiSono()">Chi sono?</button>
+  <p id="esito"></p>
+  <p id="tok"></p>
+
+  <script>
+    let TOKEN = '';
+    async function entra(){
+      const r = await fetch('/api/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          matricola: document.getElementById('matr').value.trim(),
+          password: document.getElementById('pwd').value
+        })
+      });
+      const d = await r.json();
+      const e = document.getElementById('esito');
+      if (d.stato === 'ok') {
+        TOKEN = d.token;
+        e.textContent = '✓ Sei entrato come ' + d.matricola + ' (ruolo: ' + d.ruolo + ')';
+        document.getElementById('tok').innerHTML = 'Il tuo gettone: <code>' + d.token + '</code>';
+      } else {
+        e.textContent = '⚠ ' + (d.motivo || 'errore');
+        document.getElementById('tok').textContent = '';
+      }
+    }
+    async function chiSono(){
+      const r = await fetch('/api/io', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+      const d = await r.json();
+      document.getElementById('esito').textContent =
+        (d.stato === 'ok') ? ('Il server mi riconosce: ' + d.matricola + ' (' + d.ruolo + ')')
+                           : ('⚠ ' + (d.motivo || 'non riconosciuto'));
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/prova-login")
+def prova_login():
+    return PAGINA_PROVA_LOGIN
 
 
 # --- PAGINETTA DI PROVA del registro variazioni (servita dal server) ---
@@ -622,6 +1015,7 @@ PAGINA_PROVA_GUASTI = """
   <button onclick="elenca()">Elenca i guasti</button>
 
   <p id="esito"></p>
+  <div id="lista"></div>
   <pre id="out"></pre>
 
   <script>
@@ -653,7 +1047,43 @@ PAGINA_PROVA_GUASTI = """
       const r = await fetch('/api/guasti');
       const d = await r.json();
       document.getElementById('esito').textContent = 'Segnalazioni totali: ' + d.quanti;
+      const box = document.getElementById('lista');
+      box.innerHTML = '';
+      d.guasti.forEach(function(g){
+        const div = document.createElement('div');
+        div.style = 'border:1px solid #ddd;border-radius:6px;padding:8px;margin:6px 0';
+        const stato = (g.stato === 'inviato')
+          ? '<b style="color:#0a7d28">✅ inviato all\\'officina</b> il ' + g.inviato_quando + (g.inviato_da ? (' da ' + g.inviato_da) : '')
+          : '<b style="color:#b26b00">🕒 da inviare</b>';
+        div.innerHTML =
+          '<b>Mezzo ' + g.mezzo + '</b> — ' + (g.tipo || '?') + ' (' + g.data + ')<br>' +
+          (g.nota || '<i>senza nota</i>') +
+          '<br><small>segnalato il ' + g.quando + (g.segnalato_da ? (' da ' + g.segnalato_da) : '') + '</small><br>' +
+          stato;
+        if (g.stato !== 'inviato') {
+          const b = document.createElement('button');
+          b.textContent = "Invia all'officina";
+          b.onclick = function(){ invia(g.id); };
+          div.appendChild(document.createElement('br'));
+          div.appendChild(b);
+        }
+        box.appendChild(div);
+      });
       mostra(d);
+    }
+
+    async function invia(id){
+      const chi = document.getElementById('matr').value.trim();
+      const r = await fetch('/api/guasti/' + encodeURIComponent(id) + '/invia', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inviato_da: chi })
+      });
+      const d = await r.json();
+      document.getElementById('esito').textContent =
+        (d.stato === 'inviato') ? '✅ Segnalazione inviata all\\'officina' :
+        (d.stato === 'gia_inviato') ? 'Era già stata inviata' : ('⚠ ' + (d.motivo || 'errore'));
+      elenca();
     }
   </script>
 </body>
