@@ -13,7 +13,11 @@
 import os
 import json                                  # per impacchettare/spacchettare i dati JSON
 from datetime import datetime
+from zoneinfo import ZoneInfo                # per convertire l'ora UTC in ora italiana
 from flask import Flask, jsonify, request, Response   # request = legge i dati "nel pacco"
+
+# fuso orario italiano (gestisce da solo ora legale/solare)
+FUSO_ITALIA = ZoneInfo("Europe/Rome")
 
 app = Flask(__name__)
 
@@ -102,15 +106,27 @@ def init_db():
 
 
 def fmt_quando(q):
-    """Mostra la data/ora in modo leggibile.
-    Postgres la restituisce gia' come data Python; SQLite come testo:
-    questa funzione gestisce bene entrambi i casi."""
+    """Mostra la data/ora in modo leggibile e in ORA ITALIANA.
+    Nel database il tempo e' salvato in UTC (standard mondiale); qui lo
+    convertiamo nel fuso italiano. Gestisce sia il formato di Postgres
+    (data Python) sia quello di SQLite (testo)."""
     if isinstance(q, datetime):
-        return q.strftime("%d/%m %H:%M")
+        dt = q
+    else:
+        dt = None
+        for formato in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                dt = datetime.strptime(str(q)[:19], formato); break
+            except Exception:
+                continue
+        if dt is None:
+            return str(q)
     try:
-        return datetime.strptime(str(q)[:16], "%Y-%m-%d %H:%M").strftime("%d/%m %H:%M")
+        # il tempo salvato e' UTC -> lo convertiamo in ora italiana
+        dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(FUSO_ITALIA)
     except Exception:
-        return str(q)
+        pass
+    return dt.strftime("%d/%m %H:%M")
 
 
 def data_valida(d):
