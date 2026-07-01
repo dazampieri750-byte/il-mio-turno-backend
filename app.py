@@ -140,6 +140,14 @@ def init_db():
             " ruolo TEXT,"
             " creato TIMESTAMP DEFAULT NOW())"
         )
+        # aziende (i clienti della piattaforma): ogni dato apparterra' a un'azienda
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS aziende ("
+            " id SERIAL PRIMARY KEY,"
+            " nome TEXT,"
+            " attiva BOOLEAN DEFAULT TRUE,"
+            " creata TIMESTAMP DEFAULT NOW())"
+        )
     else:
         cur.execute(
             "CREATE TABLE IF NOT EXISTS messaggi ("
@@ -200,6 +208,13 @@ def init_db():
             " matricola TEXT,"
             " ruolo TEXT,"
             " creato TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS aziende ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " nome TEXT,"
+            " attiva INTEGER DEFAULT 1,"
+            " creata TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
     # migrazione: aggiunge ai guasti le colonne di INVIO anche se la tabella
     # esisteva gia' (cosi' non serve ricreare il database)
@@ -873,6 +888,198 @@ PAGINA_PROVA_LOGIN = """
 @app.route("/prova-login")
 def prova_login():
     return PAGINA_PROVA_LOGIN
+
+
+# =====================================================================
+#  MASTER e AZIENDE (multi-azienda)
+# =====================================================================
+
+# Crea il PRIMO account master. Protetto da un codice segreto (SETUP_CODE),
+# che imposti tu su Render. Funziona una volta sola: se un master esiste gia', rifiuta.
+@app.route("/api/setup-master", methods=["POST"])
+def api_setup_master():
+    dati = request.get_json(silent=True) or {}
+    codice = str(dati.get("codice") or "")
+    utente = str(dati.get("utente") or "").strip()
+    password = str(dati.get("password") or "")
+    atteso = os.environ.get("SETUP_CODE", "")
+    if not atteso or codice != atteso:
+        return jsonify({"stato": "errore", "motivo": "codice di setup errato o non impostato"}), 403
+    if not utente or len(password) < 6:
+        return jsonify({"stato": "errore", "motivo": "servono nome utente e password (min 6)"}), 400
+    con = get_conn(); cur = con.cursor()
+    cur.execute("SELECT 1 FROM utenti WHERE ruolo='master' LIMIT 1")
+    if cur.fetchone():
+        cur.close(); con.close()
+        return jsonify({"stato": "errore", "motivo": "esiste gia' un account master"}), 409
+    cur.execute(f"SELECT 1 FROM utenti WHERE matricola={PH}", (utente,))
+    if cur.fetchone():
+        cur.close(); con.close()
+        return jsonify({"stato": "errore", "motivo": "nome utente gia' in uso"}), 409
+    ph = generate_password_hash(password)
+    cur.execute(f"INSERT INTO utenti (matricola, password_hash, ruolo) VALUES ({PH},{PH},'master')",
+                (utente, ph))
+    con.commit(); cur.close(); con.close()
+    return jsonify({"stato": "ok", "utente": utente, "ruolo": "master"}), 201
+
+
+@app.route("/api/aziende", methods=["GET", "POST"])
+def api_aziende():
+    # POST: crea un'azienda (solo il master puo')
+    if request.method == "POST":
+        u = utente_corrente()
+        if not u or u["ruolo"] != "master":
+            return jsonify({"stato": "errore", "motivo": "solo il master puo' creare aziende"}), 403
+        dati = request.get_json(silent=True) or {}
+        nome = str(dati.get("nome") or "").strip()
+        if not nome:
+            return jsonify({"stato": "errore", "motivo": "manca il nome azienda"}), 400
+        con = get_conn(); cur = con.cursor()
+        if USA_POSTGRES:
+            cur.execute("INSERT INTO aziende (nome) VALUES (%s) RETURNING id", (nome,))
+            new_id = cur.fetchone()[0]
+        else:
+            cur.execute("INSERT INTO aziende (nome) VALUES (?)", (nome,))
+            new_id = cur.lastrowid
+        con.commit(); cur.close(); con.close()
+        return jsonify({"stato": "ok", "id": new_id, "nome": nome}), 201
+
+    # GET: elenco pubblico (serve alla tendina della registrazione)
+    con = get_conn(); cur = con.cursor()
+    if USA_POSTGRES:
+        cur.execute("SELECT id, nome FROM aziende WHERE attiva ORDER BY nome")
+    else:
+        cur.execute("SELECT id, nome FROM aziende WHERE attiva=1 ORDER BY nome")
+    righe = cur.fetchall(); cur.close(); con.close()
+    return jsonify({"aziende": [{"id": r[0], "nome": r[1]} for r in righe]})
+
+
+# --- PAGINETTA per creare il primo master ---
+PAGINA_SETUP_MASTER = """
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Setup master</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 480px;
+           margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 22px; }
+    label { display: inline-block; width: 110px; }
+    input { padding: 9px; font-size: 16px; margin: 5px 0; width: 55%; }
+    button { padding: 10px 16px; font-size: 15px; cursor: pointer; margin-top: 8px; }
+    #esito { min-height: 22px; font-weight: bold; margin-top: 12px; }
+    .nota { background:#fff7e0; border:1px solid #f0d97a; padding:10px; border-radius:6px; font-size:14px; }
+  </style>
+</head>
+<body>
+  <h1>Crea l'account master</h1>
+  <p class="nota">Serve il <b>codice di setup</b> che hai impostato su Render (SETUP_CODE).
+     Funziona una volta sola: crea il primo amministratore della piattaforma (tu).</p>
+  <div><label>Codice setup</label><input id="codice" type="password"></div>
+  <div><label>Nome utente</label><input id="utente" placeholder="es. davide"></div>
+  <div><label>Password</label><input id="pwd" type="password" placeholder="min 6 caratteri"></div>
+  <button onclick="crea()">Crea master</button>
+  <p id="esito"></p>
+
+  <script>
+    async function crea(){
+      const r = await fetch('/api/setup-master', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          codice: document.getElementById('codice').value,
+          utente: document.getElementById('utente').value.trim(),
+          password: document.getElementById('pwd').value
+        })
+      });
+      const d = await r.json();
+      document.getElementById('esito').textContent =
+        (d.stato === 'ok') ? ('✓ Master creato: ' + d.utente) : ('⚠ ' + (d.motivo || 'errore'));
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/setup-master")
+def setup_master_page():
+    return PAGINA_SETUP_MASTER
+
+
+# --- PAGINETTA MASTER: entra e gestisci le aziende ---
+PAGINA_PROVA_MASTER = """
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pannello master</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 560px;
+           margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 24px; }
+    label { display: inline-block; width: 90px; }
+    input { padding: 9px; font-size: 16px; margin: 4px 0; }
+    button { padding: 9px 14px; font-size: 15px; cursor: pointer; margin: 6px 6px 6px 0; }
+    #esito { min-height: 22px; font-weight: bold; }
+    ul { padding-left: 18px; } li { margin: 4px 0; }
+    .box { border:1px solid #ddd; border-radius:8px; padding:12px; margin-top:12px; }
+  </style>
+</head>
+<body>
+  <h1>Pannello master</h1>
+
+  <div class="box">
+    <h2>1) Entra</h2>
+    <div><label>Utente</label><input id="u" placeholder="il tuo nome master"></div>
+    <div><label>Password</label><input id="p" type="password"></div>
+    <button onclick="entra()">Entra</button>
+  </div>
+
+  <div class="box">
+    <h2>2) Aziende</h2>
+    <div><label>Nome</label><input id="nome" placeholder="es. ATC La Spezia"></div>
+    <button onclick="crea()">Crea azienda</button>
+    <button onclick="elenca()">Elenca aziende</button>
+    <ul id="lista"></ul>
+  </div>
+
+  <p id="esito"></p>
+
+  <script>
+    let TOKEN = '';
+    async function entra(){
+      const r = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ matricola: document.getElementById('u').value.trim(), password: document.getElementById('p').value }) });
+      const d = await r.json();
+      if (d.stato === 'ok' && d.ruolo === 'master') { TOKEN = d.token; document.getElementById('esito').textContent = '✓ Entrato come master'; elenca(); }
+      else if (d.stato === 'ok') document.getElementById('esito').textContent = '⚠ Questo account non è master';
+      else document.getElementById('esito').textContent = '⚠ ' + (d.motivo || 'errore');
+    }
+    async function crea(){
+      if (!TOKEN) { document.getElementById('esito').textContent = 'Prima entra come master'; return; }
+      const r = await fetch('/api/aziende', { method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+        body: JSON.stringify({ nome: document.getElementById('nome').value.trim() }) });
+      const d = await r.json();
+      document.getElementById('esito').textContent = (d.stato==='ok') ? ('✓ Azienda creata: '+d.nome) : ('⚠ '+(d.motivo||'errore'));
+      document.getElementById('nome').value=''; elenca();
+    }
+    async function elenca(){
+      const r = await fetch('/api/aziende'); const d = await r.json();
+      const ul = document.getElementById('lista'); ul.innerHTML='';
+      (d.aziende||[]).forEach(function(a){ const li=document.createElement('li'); li.textContent = '#'+a.id+' — '+a.nome; ul.appendChild(li); });
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/prova-master")
+def prova_master_page():
+    return PAGINA_PROVA_MASTER
 
 
 # --- PAGINETTA DI PROVA del registro variazioni (servita dal server) ---
